@@ -177,7 +177,7 @@ independently guess at facts about the game that aren't given here.
 - Expected Survival Hours: {s['expected_survival_hours']} hrs
 - Predicted 50% Abandonment Point: {abandon_str}
 - Current Retail Price: {f['current_price']} {f['currency']}
-- Fair Value Target (WTP): ${wtp['wtp_mid']} {f['currency']} (Range: ${wtp['wtp_low']} - ${wtp['wtp_high']})
+- Willingness-to-Pay Range: {wtp['wtp_low']} - {wtp['wtp_high']} {f['currency']} (Central: {wtp['wtp_central']} {f['currency']})
 - Engine Verdict: {f['verdict']}
 - Veto Triggered: {f['veto_triggered']}
 
