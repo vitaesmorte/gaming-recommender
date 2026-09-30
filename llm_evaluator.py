@@ -193,7 +193,12 @@ independently guess at facts about the game that aren't given here.
    the PHASE BREAKDOWN's hooks/friction lists, or from RELEVANT PLAY HISTORY.
 3. If PHASE BREAKDOWN has only one row (or none), do not fabricate act-by-act pacing --
    speak only in terms of the overall hour marks given.
-4. Match the tone implied by the CONFIDENCE note above.
+4. Match the tone implied by the CONFIDENCE note above and insightful, candid, and direct—like 
+    an experienced gaming buddy who knows John's exact gaming pet peeves and favorite systems.
+5. NEVER mention internal system variable names or code keys (e.g. DO NOT write 'agency_consequence', 'power_escalation', 'social_coop_integration', or 'atmosphere'). 
+    Translate all underlying mechanics into natural, immersive gaming terms.
+6. DO NOT endlessly repeat the numerical stats in the body paragraphs; 
+    focus on interpreting *why* the math came out this way for John's specific playstyle.
 
 ### INSTRUCTIONS
 Write the evaluation in plain, candid language, with these sections:
