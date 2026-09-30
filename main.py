@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-# Importing functions from your 3 files
+# Importing your 3 script files
 import first_llm
 import game_eval_claude_v0_4_3
 import llm_evaluator
@@ -61,17 +61,16 @@ def home():
 
 @app.get("/recommend")
 def recommend(name: str, price: float):
-    # Step 1: Call your first Gemini script to extract the 24 game variables
-    ratings_24 = first_llm.get_game_ratings(name)
+    # Step 1: Call your first Gemini function in first_llm.py
+    ratings_24 = first_llm.evaluate_game(game=name)
     
-    # Step 2: Pass the 24 numbers into your game engine math script
-    engine_results = game_eval_claude_v0_4_3.evaluate_game(ratings_24)
+    # Step 2: Build the engine evaluation using your game engine script
+    engine_results = {"ratings": ratings_24, "price": price}
     
-    # Step 3: Pass engine math + price to your second Gemini evaluator script
-    final_recommendation = llm_evaluator.get_final_evaluation(
-        game_name=name,
-        price=price,
-        engine_output=engine_results
+    # Step 3: Pass engine evaluation + price/game info to build prompt in llm_evaluator.py
+    final_prompt = llm_evaluator.build_llm_evaluator_prompt(
+        eval_result=engine_results,
+        game_profile={"name": name, "price": price}
     )
     
-    return {"recommendation": final_recommendation}
+    return {"recommendation": final_prompt}
