@@ -554,6 +554,7 @@ def evaluate_game(
     historical_similarity: float = 0.80,
     actual_played: float = 0.0,
     base_value_per_hour: float = 1.50,
+    verdict_tolerance: float = 0.10,
 ) -> Dict:
     static_vector = game.profile.static_vector
     personal_fit = calculate_base_fit(static_vector, player, variable_definitions)
@@ -587,11 +588,20 @@ def evaluate_game(
         expected_enjoyable_hours, adjusted_fit, commitment_fit, confidence, value_density, player.human_factor, base_value_per_hour
     )
 
+    # wtp_low/wtp_high already model +/-25% uncertainty around wtp_central,
+    # but the original cutoff between "BUY / SALE" and "WAIT" was a single
+    # exact dollar value with zero tolerance -- $1 over central got the
+    # same "WAIT" label as $5 over. near_value_price gives a small band
+    # (default 10%) around central that still counts as a buy, so a price
+    # that's essentially at fair value isn't bucketed with ones that
+    # genuinely aren't.
+    near_value_price = wtp["wtp_central"] * (1.0 + verdict_tolerance)
+
     if veto_triggered:
         verdict = "SKIP"
     elif adjusted_fit >= 0.82 and confidence >= 0.75 and game.current_price <= wtp["wtp_low"]:
         verdict = "BUY — FULL PRICE"
-    elif game.current_price <= wtp["wtp_central"]:
+    elif game.current_price <= near_value_price:
         verdict = "BUY / SALE"
     elif game.current_price <= wtp["wtp_high"]:
         verdict = "WAIT"
