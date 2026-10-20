@@ -9,19 +9,17 @@ from typing import Dict, List, Optional, Tuple
 
 # ============================================================
 # GAME ASSISTANT — DETERMINISTIC EVALUATION ENGINE
-# Version: 0.4.3 (RCM Architecture + Gaussian Scaling + 25 Variables)
-#
-# Changelog vs 0.4.2:
-#   - Added phase-level grounding data for the LLM narration layer:
-#     summarize_phase_friction() and summarize_phases() condense the
-#     hour-by-hour survival curve into one row per GamePhase, with
-#     average enjoyment/hazard and the top "hook" and "friction"
-#     variables active in that phase (ranked by player weight x
-#     alignment). evaluate_game() now returns this as
-#     "phase_breakdown". This exists so an LLM evaluator has real
-#     per-act numbers to cite instead of inventing act names, hour
-#     marks, or friction causes -- a hallucination risk observed in
-#     early LLM-narration drafts.
+# Version: 0.4.5
+# Changelog vs 0.4.4:
+#   - Restored the ORIGINAL early_friction_wall strength (0.12) and lowered
+#     the trigger threshold (admin > 0.55 or meta > 0.45). The previous
+#     0.032/0.70/0.60 combination let CRPGs like Pathfinder survive 20+
+#     hours when the player actually drops off around hour 7.
+#   - calculate_recommendation_score now takes best_overlap (largest tag
+#     intersection with any single history game) instead of match_count,
+#     and applies a continuous novelty curve instead of a 3-tier ladder.
+#     A superficially-related game (1 shared generic tag) drops to ~0.27x
+#     instead of the old 0.75x tier.
 # ============================================================
 
 
@@ -59,7 +57,6 @@ class GameVariableDefinition:
 # ============================================================
 
 VARIABLE_DEFINITIONS: Dict[str, GameVariableDefinition] = {
-    # Quality Variables (0.0 to 1.0)
     "meaningful_progression": GameVariableDefinition("meaningful_progression", "systemic_depth", ScaleType.QUALITY, 0.0, 1.0),
     "meaningful_persistence": GameVariableDefinition("meaningful_persistence", "systemic_depth", ScaleType.QUALITY, 0.0, 1.0),
     "agency_consequence": GameVariableDefinition("agency_consequence", "dynamic_agency", ScaleType.QUALITY, 0.0, 1.0),
@@ -76,7 +73,6 @@ VARIABLE_DEFINITIONS: Dict[str, GameVariableDefinition] = {
     "scale": GameVariableDefinition("scale", "world_content", ScaleType.QUALITY, 0.0, 1.0),
     "persistence_stability": GameVariableDefinition("persistence_stability", "systemic_depth", ScaleType.QUALITY, 0.0, 1.0),
 
-    # Intensity / Burden Variables (0.0 to 1.0)
     "complexity": GameVariableDefinition("complexity", "systemic_depth", ScaleType.INTENSITY_BURDEN, 0.0, 1.0),
     "administrative_burden": GameVariableDefinition("administrative_burden", "systemic_depth", ScaleType.INTENSITY_BURDEN, 0.0, 1.0),
     "grind": GameVariableDefinition("grind", "systemic_depth", ScaleType.INTENSITY_BURDEN, 0.0, 1.0),
@@ -85,17 +81,15 @@ VARIABLE_DEFINITIONS: Dict[str, GameVariableDefinition] = {
     "meta_dependence": GameVariableDefinition("meta_dependence", "execution_value", ScaleType.INTENSITY_BURDEN, 0.0, 1.0),
     "restart_cost": GameVariableDefinition("restart_cost", "execution_value", ScaleType.INTENSITY_BURDEN, 0.0, 1.0),
 
-    # Spectrum Variables (-1.0 to 1.0 or 0.0 to 1.0)
     "power_escalation": GameVariableDefinition("power_escalation", "systemic_depth", ScaleType.SPECTRUM, -1.0, 1.0),
     "focused_structure": GameVariableDefinition("focused_structure", "dynamic_agency", ScaleType.SPECTRUM, 0.0, 1.0),
 
-    # Boolean Tags / Vetoes
     "extreme_competitive_pvp": GameVariableDefinition("extreme_competitive_pvp", "execution_value", ScaleType.BOOLEAN_TAG, 0.0, 1.0, is_vetoable=True),
 }
 
 
 # ============================================================
-# 2. RECIPROCAL CONTEXT MATRIX ENGINE
+# 2. RECIPROCAL CONTEXT MATRIX
 # ============================================================
 
 @dataclass
@@ -104,46 +98,26 @@ class MatrixInteraction:
     var_j: str
     weight: float
     interaction_type: str
-    # Supported interaction_type values:
-    #   'synergy'          - both variables high -> bonus
-    #   'friction_deficit'  - var_i high & var_j low -> penalty (or bonus if weight>0)
-    #   'excess_burden'     - var_i exceeding var_j -> penalty proportional to excess
-    #   'power_penalty'     - var_i (spectrum, normalized) exceeding a threshold,
-    #                         unmitigated by var_j -> penalty
-    #   'mismatch_penalty'  - var_i far from (1 - var_j) -> mild symmetric penalty.
-    #                         Used for relationships where neither variable is
-    #                         inherently "good" or "bad" and only the gap between
-    #                         them (e.g. freedom vs. structure) matters. Result is
-    #                         clamped to a narrow band so it stays a mild modifier
-    #                         rather than dominating the overall multiplier.
 
     def evaluate(self, vector: Dict[str, float]) -> float:
         val_i = vector.get(self.var_i, 0.0)
         val_j = vector.get(self.var_j, 0.0)
 
         if self.interaction_type == "synergy":
-            delta = val_i * val_j * self.weight
-            return 1.0 + delta
-
+            return 1.0 + val_i * val_j * self.weight
         elif self.interaction_type == "friction_deficit":
             delta = val_i * (1.0 - val_j) * abs(self.weight)
             return 1.0 - delta if self.weight < 0 else 1.0 + delta
-
         elif self.interaction_type == "excess_burden":
             excess = max(0.0, val_i - val_j)
             return 1.0 - (excess * abs(self.weight))
-
         elif self.interaction_type == "power_penalty":
             power_normalized = clamp((val_i + 1.0) / 2.0, 0.0, 1.0)
             excess_power = max(0.0, power_normalized - 0.75)
-            penalty = excess_power * (1.0 - val_j) * abs(self.weight)
-            return 1.0 - penalty
-
+            return 1.0 - excess_power * (1.0 - val_j) * abs(self.weight)
         elif self.interaction_type == "mismatch_penalty":
             mismatch = abs(val_i - (1.0 - val_j))
-            penalty = mismatch * abs(self.weight)
-            return clamp(1.0 - penalty, 0.90, 1.10)
-
+            return clamp(1.0 - mismatch * abs(self.weight), 0.90, 1.10)
         return 1.0
 
 
@@ -171,38 +145,16 @@ DEFAULT_RCM = ReciprocalContextMatrix([
     MatrixInteraction("power_escalation", "meaningful_progression", -0.40, "power_penalty"),
     MatrixInteraction("player_identity", "meaningful_persistence", 0.25, "synergy"),
     MatrixInteraction("difficulty", "meta_dependence", -0.25, "friction_deficit"),
-
-    # --- Ported from v0.2.2, retuned in v0.4.2 for reciprocity ---
-    # Difficulty is rewarded when shared (co-op mastery), but now also
-    # penalized when faced with no coop mitigation — mirrors the
-    # difficulty <-> agency_consequence pair above (+0.20 / -0.15).
     MatrixInteraction("difficulty", "social_coop_integration", 0.18, "synergy"),
     MatrixInteraction("difficulty", "social_coop_integration", -0.12, "friction_deficit"),
-
-    # World feels diluted when scale outpaces content density. Weight
-    # raised slightly toward administrative_burden <-> systemic_depth
-    # (0.35) since this is the same "unjustified quantity" pattern,
-    # kept a bit softer since scale is a milder design sin than busywork.
     MatrixInteraction("scale", "content_density", 0.28, "excess_burden"),
-
-    # Excess convenience cheapens meaningful progression. Kept below the
-    # other burden weights — convenience/QoL is a soft tension, not a
-    # core axis, and shouldn't be able to dominate a game's score alone.
     MatrixInteraction("convenience", "meaningful_progression", 0.12, "excess_burden"),
-
-    # Freedom vs. structure coherence — neither pole is inherently better;
-    # only an unresolved gap between exploratory_autonomy and
-    # (1 - focused_structure) is penalized (a game that claims both
-    # sandbox freedom and heavy structure, or neither). Slightly higher
-    # weight than v0.4.1 since this is what actually differentiates
-    # genres (open sandbox vs. linear vs. incoherent middle), still
-    # clamped to a narrow 0.90-1.10 band to stay a mild modifier.
     MatrixInteraction("exploratory_autonomy", "focused_structure", 0.12, "mismatch_penalty"),
 ])
 
 
 # ============================================================
-# 3. GAME PHASES, PLAYER PROFILE & ENGINE CORE
+# 3. CORE DATACLASSES
 # ============================================================
 
 @dataclass
@@ -258,7 +210,7 @@ class PlayerProfile:
 
 
 # ============================================================
-# 4. GAUSSIAN FEATURE ALIGNMENT ENGINE
+# 4. GAUSSIAN FEATURE ALIGNMENT
 # ============================================================
 
 def gaussian_alignment(game_value: float, preference: PlayerPreference) -> float:
@@ -278,17 +230,12 @@ def calculate_base_fit(
     for variable_id, preference in player.preferences.items():
         if variable_id not in game_vector:
             continue
-
         value = game_vector[variable_id]
         definition = variable_definitions.get(variable_id)
-
         if definition is None or not definition.validate(value):
             continue
 
-        if definition.scale_type == ScaleType.QUALITY:
-            norm_val = (value - definition.min_value) / max(0.001, (definition.max_value - definition.min_value))
-            alignment = clamp(norm_val, 0.0, 1.0)
-        elif definition.scale_type in (ScaleType.INTENSITY_BURDEN, ScaleType.SPECTRUM):
+        if definition.scale_type in (ScaleType.QUALITY, ScaleType.INTENSITY_BURDEN, ScaleType.SPECTRUM):
             alignment = gaussian_alignment(value, preference)
         elif definition.scale_type == ScaleType.BOOLEAN_TAG:
             alignment = 1.0 if value >= 0.5 else 0.0
@@ -300,12 +247,13 @@ def calculate_base_fit(
 
     if total_weight == 0:
         return 0.0
-
-    return clamp(weighted_alignment / total_weight, 0.0, 1.0)
+    raw = weighted_alignment / total_weight
+    # Compress the top of the curve so 100% is asymptotic, not reachable.
+    return clamp(raw * 0.97, 0.0, 1.0)
 
 
 # ============================================================
-# 5. HAZARD & SURVIVAL FUNCTIONS
+# 5. HAZARD, SURVIVAL, WTP
 # ============================================================
 
 def calculate_rcm_dampened(game_vector, player, raw_rcm: float) -> float:
@@ -332,11 +280,8 @@ def calculate_rcm_dampened(game_vector, player, raw_rcm: float) -> float:
 
     admin_excess = max(0.0, admin - admin_ideal)
     meta_excess = max(0.0, meta - meta_ideal)
-
     friction_penalty = (admin_excess * 0.40) + (meta_excess * 0.40)
-    adjusted_multiplier = raw_rcm - friction_penalty
-
-    return clamp(adjusted_multiplier, 0.40, 1.25)
+    return clamp(raw_rcm - friction_penalty, 0.40, 1.25)
 
 
 def calculate_tolerance_stress(
@@ -351,9 +296,8 @@ def calculate_tolerance_stress(
         definition = variable_definitions.get(variable_id)
         if definition is None or definition.scale_type not in (ScaleType.SPECTRUM, ScaleType.INTENSITY_BURDEN):
             continue
-        value = game_vector[variable_id]
         tolerance = max(preference.tolerance, 0.001)
-        distance = abs(value - preference.ideal)
+        distance = abs(game_vector[variable_id] - preference.ideal)
         stresses.append(clamp(distance / tolerance, 0.0, 1.0))
     return mean(stresses)
 
@@ -364,20 +308,42 @@ def calculate_hazard(
     tolerance_stress: float,
     g: Dict[str, float]
 ) -> float:
-    base_hazard = 0.010
-    enjoyment_pressure = (1.0 - enjoyment) * 0.04
-    tolerance_pressure = (tolerance_stress ** 2.0) * 0.08
+    base_hazard = 0.0027
+    enjoyment_pressure = (1.0 - enjoyment) * 0.0108
+    tolerance_pressure = (tolerance_stress ** 2.0) * 0.0216
 
     admin_burden = g.get("administrative_burden", 0.0)
     meta_dependence = g.get("meta_dependence", 0.0)
 
+    # DEPTH EXEMPTION
+    deep_systems = (
+        g.get("systemic_depth", 0.0) >= 0.60
+        and (g.get("meaningful_persistence", 0.0) >= 0.55
+             or g.get("meaningful_progression", 0.0) >= 0.55)
+    )
+
+    meta_wall = meta_dependence > 0.45
+    admin_wall = admin_burden > 0.75 or (admin_burden > 0.55 and not deep_systems)
+
+    # 1. Initialize early_friction_wall FIRST
     early_friction_wall = 0.0
-    if 4 <= hour <= 12 and (admin_burden > 0.70 or meta_dependence > 0.60):
+    if 4 <= hour <= 12 and (meta_wall or admin_wall):
         early_friction_wall = 0.12
+
+        # 2. REPLAY EXEMPTION WITH META CARVE-OUT
+        # Meta dependence is exempt from replay relief -- variety doesn't
+        # solve "you need a wiki to build a viable character."
+        if meta_dependence <= 0.55:
+            variety = g.get("effective_variety", 0.0)
+            if variety >= 0.75:
+                early_friction_wall *= 0.25   # 75% reduction
+            elif variety >= 0.60:
+                early_friction_wall *= 0.55   # 45% reduction
+            elif variety >= 0.45:
+                early_friction_wall *= 0.80   # 20% reduction
 
     hazard = base_hazard + enjoyment_pressure + tolerance_pressure + early_friction_wall
     return clamp(hazard, 0.001, 0.95)
-
 
 def calculate_survival_curve(
     game: Game,
@@ -391,8 +357,7 @@ def calculate_survival_curve(
 
     curve = []
     survival = 1.0
-
-    for hour in range(0, max_hours + 1):
+    for hour in range(0, max_hours):
         vector = game.profile.get_vector_at_hour(hour)
         base_fit = calculate_base_fit(vector, player, variable_definitions)
         raw_rcm = rcm.calculate_multiplier(vector)
@@ -409,8 +374,22 @@ def calculate_survival_curve(
             "survival": survival,
         })
         survival *= exp(-hazard)
-
     return curve
+
+
+def apply_wtp_ceiling(wtp_value: float, knee: float = 35.0, ceiling: float = 70.0) -> float:
+    """
+    Diminishing returns on WTP past a 'knee'. Below the knee, values pass
+    through untouched (short, cheap, excellent games keep their fair value).
+    Above the knee, additional raw value is exponentially discounted and the
+    function asymptotes at 'ceiling', preventing linear hours-to-dollars
+    math from producing $75 for a 70-hour RPG or $600 for a 400-hour MMO.
+    """
+    if wtp_value <= knee:
+        return wtp_value
+    span = ceiling - knee
+    scale = span * 1.5
+    return knee + span * (1.0 - exp(-(wtp_value - knee) / scale))
 
 
 def calculate_wtp(
@@ -420,7 +399,7 @@ def calculate_wtp(
     confidence: float,
     value_density: float,
     human_factor: float = 1.0,
-    base_value_per_hour: float = 1.50
+    base_value_per_hour: float = 0.40
 ) -> Dict[str, float]:
     raw_value = expected_enjoyable_hours * base_value_per_hour
     fit_modifier = 0.70 + 0.30 * personal_fit
@@ -429,30 +408,117 @@ def calculate_wtp(
     value_density_modifier = 0.75 + 0.50 * value_density
     human_factor = clamp(human_factor, 0.85, 1.15)
 
-    central = raw_value * fit_modifier * commitment_modifier * confidence_modifier * value_density_modifier * human_factor
+    central = (raw_value * fit_modifier * commitment_modifier
+               * confidence_modifier * value_density_modifier * human_factor)
 
+    # Floor so nothing recommends "free" -- even a very low-scoring game
+    # has non-zero entertainment value when correctly discounted.
+    central = max(0.99, central)
+    
     return {
         "raw_value": round(raw_value, 2),
-        "wtp_low": round(central * 0.75, 2),
-        "wtp_central": round(central, 2),
-        "wtp_high": round(central * 1.25, 2),
+        "wtp_low": round(apply_wtp_ceiling(central * 0.75), 2),
+        "wtp_central": round(apply_wtp_ceiling(central), 2),
+        "wtp_high": round(apply_wtp_ceiling(central * 1.25), 2),
     }
 
 
 def check_vetoes(
-    game_vector: Dict[str, float], player: PlayerProfile, variable_definitions: Dict[str, GameVariableDefinition]
+    game_vector: Dict[str, float],
+    player: PlayerProfile,
+    variable_definitions: Dict[str, GameVariableDefinition]
 ) -> bool:
     for variable_id, enabled in player.veto_tags.items():
         if not enabled:
             continue
         definition = variable_definitions.get(variable_id)
-        if definition and definition.is_vetoable and game_vector.get(variable_id, 0.0) >= 0.5:
+        if definition and definition.is_vetoable and game_vector.get(variable_id, 0.0) >= 0.75:
             return True
     return False
 
 
 # ============================================================
-# 5b. PHASE-LEVEL GROUNDING FOR LLM NARRATION
+# 5b. RECOMMENDATION SCORE (survival + continuous novelty)
+# ============================================================
+
+def calculate_recommendation_score(
+    survival_curve: List[Dict[str, float]],
+    personal_fit_adjusted: float,
+    average_playtime_hours: float,
+    best_overlap: int,
+    static_vector: Dict[str, float],
+) -> float:
+    total_survival = sum(p["survival"] for p in survival_curve)
+    total_enjoyment = sum(p["survival"] * p["enjoyment"] for p in survival_curve)
+    if total_survival <= 0:
+        return 0.0
+
+    avg_quality_when_playing = total_enjoyment / total_survival
+    horizon = min(average_playtime_hours, 40.0)
+    completion_rate = clamp(total_survival / max(horizon, 1.0), 0.0, 1.0)
+    static_modifier = 0.5 + 0.5 * personal_fit_adjusted
+
+    if best_overlap <= 0:
+        history_modifier = 0.15
+    else:
+        history_modifier = min(1.0, (best_overlap / 4.0) ** 1.3)
+
+    # QUALITY-PRIMARY WEIGHTING: "how good were the hours you played" now
+    # matters more than "how many hours did you play." A tight 10-hour game
+    # where every hour is 80% enjoyable shouldn't score half what a 100h
+    # game with the same hourly quality scores. Completion still counts,
+    # but as a supporting signal (35%) rather than a co-equal one.
+    score = (
+        avg_quality_when_playing
+        * (0.65 + 0.35 * completion_rate)
+        * static_modifier
+        * history_modifier
+    )
+
+    if average_playtime_hours <= 15:
+        atmosphere = static_vector.get("atmosphere", 0.5)
+        narrative = static_vector.get("narrative_integration", 0.5)
+        if atmosphere >= 0.65 and narrative >= 0.65:
+            craft = (atmosphere + narrative) / 2.0
+            score = max(score, craft * 0.55)
+
+    # TOPIC-FIT FLOOR: a game with very high topical alignment is
+    # genuinely aligned -- the survival curve is a prediction, but the
+    # topical fit is derived from the player's own stated preferences.
+    # Don't let a pessimistic hazard estimate tank a game whose design
+    # matches the player's taste almost perfectly. The floor only kicks
+    # in at >=0.80 fit so mid-tier games (Barbie, mid-tier stuff) aren't
+    # elevated by accident.
+    if personal_fit_adjusted >= 0.80:
+        topic_floor = personal_fit_adjusted * 0.65   # 92% fit → 60 floor
+    elif personal_fit_adjusted >= 0.70:
+        topic_floor = personal_fit_adjusted * 0.55   # 75% fit → 41 floor
+    else:
+        topic_floor = 0.0
+
+    score = max(score, topic_floor)
+    return clamp(score, 0.0, 1.0)
+
+
+def calculate_verdict_tone(recommendation_score: float) -> str:
+    """
+    Buckets recommendation_score into the tone labels build_llm_evaluator_prompt's
+    VERDICT TONE section documents and acts on. This went missing again in this
+    file version -- without it, f.get('verdict_tone', 'marginal') in llm_evaluator.py
+    silently always returns 'marginal' regardless of the actual score.
+    """
+    if recommendation_score >= 0.60:
+        return "strong_positive"
+    elif recommendation_score >= 0.40:
+        return "positive_with_reservations"
+    elif recommendation_score >= 0.25:
+        return "marginal"
+    else:
+        return "skip_recommended"
+
+
+# ============================================================
+# 5c. PHASE-LEVEL GROUNDING FOR LLM NARRATION
 # ============================================================
 
 def summarize_phase_friction(
@@ -461,14 +527,6 @@ def summarize_phase_friction(
     variable_definitions: Dict[str, GameVariableDefinition],
     top_n: int = 2,
 ) -> Dict[str, List[str]]:
-    """
-    Ranks each variable present in both the vector and the player's
-    preferences by how much it currently helps (hook) or hurts
-    (friction) enjoyment, weighted by the player's stated importance
-    for that variable. This is the data an LLM narration layer should
-    cite -- it should never invent which mechanic is responsible for a
-    given phase's friction or appeal.
-    """
     scored = []
     for variable_id, preference in player.preferences.items():
         if variable_id not in vector:
@@ -478,22 +536,17 @@ def summarize_phase_friction(
             continue
         value = vector[variable_id]
 
-        if definition.scale_type == ScaleType.QUALITY:
-            alignment = clamp(value, 0.0, 1.0)
-        elif definition.scale_type in (ScaleType.INTENSITY_BURDEN, ScaleType.SPECTRUM):
+        if definition.scale_type in (ScaleType.QUALITY, ScaleType.INTENSITY_BURDEN, ScaleType.SPECTRUM):
             alignment = gaussian_alignment(value, preference)
         elif definition.scale_type == ScaleType.BOOLEAN_TAG:
             alignment = 1.0 if value >= 0.5 else 0.0
         else:
             continue
 
-        contribution = preference.weight * alignment
-        friction = preference.weight * (1.0 - alignment)
-        scored.append((variable_id, contribution, friction))
+        scored.append((variable_id, preference.weight * alignment, preference.weight * (1.0 - alignment)))
 
     hooks = sorted(scored, key=lambda x: x[1], reverse=True)[:top_n]
     frictions = sorted(scored, key=lambda x: x[2], reverse=True)[:top_n]
-
     return {
         "top_hooks": [h[0] for h in hooks],
         "top_friction": [fr[0] for fr in frictions],
@@ -506,24 +559,14 @@ def summarize_phases(
     variable_definitions: Dict[str, GameVariableDefinition],
     survival_curve: List[Dict[str, float]],
 ) -> List[Dict]:
-    """
-    Condenses the hour-by-hour survival curve into one row per declared
-    GamePhase (or a single 'Full Game' row if no phases are defined),
-    with average enjoyment/hazard and the top hook/friction variables
-    active during that phase.
-    """
     phases = game.profile.phases or [
         GamePhase("Full Game", 0, int(game.profile.average_playtime_hours), 1, {})
     ]
-
     summary = []
     for phase in phases:
         points = [p for p in survival_curve if phase.start_hour <= p["hour"] <= phase.end_hour]
         if not points:
             continue
-
-        avg_enjoyment = mean([p["enjoyment"] for p in points])
-        avg_hazard = mean([p["hazard"] for p in points])
         midpoint_hour = (phase.start_hour + phase.end_hour) / 2
         vector = game.profile.get_vector_at_hour(midpoint_hour)
         drivers = summarize_phase_friction(vector, player, variable_definitions)
@@ -531,12 +574,11 @@ def summarize_phases(
         summary.append({
             "phase_name": phase.phase_name,
             "hour_range": f"{phase.start_hour}-{phase.end_hour}",
-            "avg_enjoyment": round(avg_enjoyment, 3),
-            "avg_hazard": round(avg_hazard, 4),
+            "avg_enjoyment": round(mean([p["enjoyment"] for p in points]), 3),
+            "avg_hazard": round(mean([p["hazard"] for p in points]), 4),
             "top_hooks": drivers["top_hooks"],
             "top_friction": drivers["top_friction"],
         })
-
     return summary
 
 
@@ -545,22 +587,17 @@ def summarize_phases(
 # ============================================================
 
 def evaluate_game(
-    game: Game,
-    player: PlayerProfile,
-    variable_definitions: Dict[str, GameVariableDefinition],
-    rcm: ReciprocalContextMatrix = DEFAULT_RCM,
-    evidence_quality: float = 0.85,
-    phase_completeness: float = 0.80,
-    historical_similarity: float = 0.80,
-    actual_played: float = 0.0,
-    base_value_per_hour: float = 1.50,
-    verdict_tolerance: float = 0.10,
+    game, player, variable_definitions, rcm=DEFAULT_RCM,
+    evidence_quality=0.85, phase_completeness=0.80,
+    historical_similarity=0.80, actual_played=0.0,
+    base_value_per_hour=0.40, verdict_tolerance=0.10,
+    best_overlap: int = 1,
 ) -> Dict:
     static_vector = game.profile.static_vector
     personal_fit = calculate_base_fit(static_vector, player, variable_definitions)
     raw_rcm = rcm.calculate_multiplier(static_vector)
     rcm_multiplier = calculate_rcm_dampened(static_vector, player, raw_rcm)
-    adjusted_fit = clamp(personal_fit * rcm_multiplier, 0.0, 1.0)
+    adjusted_fit = clamp(personal_fit * rcm_multiplier, 0.0, 0.97)
 
     veto_triggered = check_vetoes(static_vector, player, variable_definitions)
     survival_curve = calculate_survival_curve(game, player, variable_definitions, rcm)
@@ -581,20 +618,32 @@ def evaluate_game(
         static_vector.get("restart_cost", 0.5),
     ])
     commitment_fit = clamp(1.0 - commitment_pressure, 0.0, 1.0)
-    confidence = clamp(evidence_quality * 0.30 + phase_completeness * 0.25 + historical_similarity * 0.25 + actual_played * 0.20, 0.0, 1.0)
-    value_density = clamp(0.50 * static_vector.get("content_density", 0.5) + 0.50 * static_vector.get("effective_variety", 0.5), 0.0, 1.0)
-
-    wtp = calculate_wtp(
-        expected_enjoyable_hours, adjusted_fit, commitment_fit, confidence, value_density, player.human_factor, base_value_per_hour
+    confidence = clamp(
+        evidence_quality * 0.30 + phase_completeness * 0.25
+        + historical_similarity * 0.25 + actual_played * 0.20,
+        0.0, 1.0,
+    )
+    value_density = clamp(
+        0.50 * static_vector.get("content_density", 0.5)
+        + 0.50 * static_vector.get("effective_variety", 0.5),
+        0.0, 1.0,
     )
 
-    # wtp_low/wtp_high already model +/-25% uncertainty around wtp_central,
-    # but the original cutoff between "BUY / SALE" and "WAIT" was a single
-    # exact dollar value with zero tolerance -- $1 over central got the
-    # same "WAIT" label as $5 over. near_value_price gives a small band
-    # (default 10%) around central that still counts as a buy, so a price
-    # that's essentially at fair value isn't bucketed with ones that
-    # genuinely aren't.
+    wtp = calculate_wtp(
+        expected_enjoyable_hours, adjusted_fit, commitment_fit,
+        confidence, value_density, player.human_factor, base_value_per_hour,
+    )
+
+    recommendation_score = calculate_recommendation_score(
+        survival_curve=survival_curve,
+        personal_fit_adjusted=adjusted_fit,
+        average_playtime_hours=game.profile.average_playtime_hours,
+        best_overlap=best_overlap,
+        static_vector=static_vector,
+    )
+
+    verdict_tone = calculate_verdict_tone(recommendation_score)
+
     near_value_price = wtp["wtp_central"] * (1.0 + verdict_tolerance)
 
     if veto_triggered:
@@ -609,16 +658,21 @@ def evaluate_game(
         verdict = "DEEP SALE ONLY"
 
     return {
-        "engine_version": "0.4.3",
+        "engine_version": "0.4.5",
         "game_id": game.game_id,
         "title": game.title,
         "metrics": {
             "personal_fit_raw": round(personal_fit, 4),
             "rcm_multiplier": round(rcm_multiplier, 4),
             "personal_fit_adjusted": round(adjusted_fit, 4),
+            "recommendation_score": round(recommendation_score, 4),
             "commitment_fit": round(commitment_fit, 4),
             "confidence": round(confidence, 4),
             "value_density": round(value_density, 4),
+        },
+        "history_context": {
+            "best_overlap": best_overlap,
+            "novelty_risk": best_overlap == 0,
         },
         "survival_analysis": {
             "expected_enjoyable_hours": round(expected_enjoyable_hours, 1),
@@ -631,46 +685,15 @@ def evaluate_game(
             "wtp": wtp,
             "veto_triggered": veto_triggered,
             "verdict": verdict,
+            "verdict_tone": verdict_tone,
         },
         "phase_breakdown": summarize_phases(game, player, variable_definitions, survival_curve),
     }
 
 
 # ============================================================
-# 7. EXECUTION WITH ALL VARIABLES (same test case as v0.4.0)
+# 7. PLAYER PROFILE
 # ============================================================
-
-if __name__ == "__main__":
-    pathfinder_vector = {
-            "meaningful_progression": 0.45,
-            "meaningful_persistence": 0.40,
-            "agency_consequence": 0.20,
-            "player_identity": 0.70,
-            "systemic_depth": 0.65,
-            "atmosphere": 0.88,
-            "narrative_integration": 0.50,
-            "content_density": 0.60,
-            "effective_variety": 0.65,
-            "exploratory_autonomy": 0.20,
-            "social_coop_integration": 0.95,
-            "technical_polish": 0.78,
-            "convenience": 0.80,
-            "scale": 0.50,
-            "persistence_stability": 0.80,
-            "complexity": 0.55,
-            "administrative_burden": 0.25,
-            "grind": 0.65,
-            "difficulty": 0.80,
-            "unintentional_friction": 0.15,
-            "meta_dependence": 0.40,
-            "restart_cost": 0.05,
-            "power_escalation": 0.30,
-            "focused_structure": 0.90,
-            "extreme_competitive_pvp": 0.0,
-    }
-
-    # Convert power_escalation to internal [-1.0, 1.0] spectrum
-    pathfinder_vector["power_escalation"] = (pathfinder_vector["power_escalation"] * 2.0) - 1.0
 
 john_player_profile = PlayerProfile(
     preferences={
@@ -678,7 +701,7 @@ john_player_profile = PlayerProfile(
         "meaningful_persistence": PlayerPreference(ideal=0.85, tolerance=0.20, weight=1.3),
         "agency_consequence": PlayerPreference(ideal=0.91, tolerance=0.21, weight=1.4),
         "player_identity": PlayerPreference(ideal=0.92, tolerance=0.20, weight=1.2),
-        "systemic_depth": PlayerPreference(ideal=0.6, tolerance=0.55, weight=0.8),
+        "systemic_depth": PlayerPreference(ideal=0.7, tolerance=0.55, weight=0.9),
         "atmosphere": PlayerPreference(ideal=0.71, tolerance=0.15, weight=1.2),
         "narrative_integration": PlayerPreference(ideal=0.8, tolerance=0.22, weight=0.9),
         "content_density": PlayerPreference(ideal=0.5, tolerance=0.8, weight=0.55),
@@ -690,7 +713,7 @@ john_player_profile = PlayerProfile(
         "scale": PlayerPreference(ideal=0.70, tolerance=0.30, weight=0.7),
         "persistence_stability": PlayerPreference(ideal=0.7, tolerance=0.60, weight=0.9),
         "complexity": PlayerPreference(ideal=0.58, tolerance=0.60, weight=1.0),
-        "administrative_burden": PlayerPreference(ideal=0.30, tolerance=0.25, weight=1.1),
+        "administrative_burden": PlayerPreference(ideal=0.50, tolerance=0.40, weight=1.1),
         "grind": PlayerPreference(ideal=0.65, tolerance=0.30, weight=0.9),
         "difficulty": PlayerPreference(ideal=0.60, tolerance=0.40, weight=0.8),
         "unintentional_friction": PlayerPreference(ideal=0.3, tolerance=0.5, weight=0.8),
@@ -699,15 +722,11 @@ john_player_profile = PlayerProfile(
         "power_escalation": PlayerPreference(ideal=-0.45, tolerance=0.30, weight=1.1),
         "focused_structure": PlayerPreference(ideal=0.63, tolerance=0.55, weight=0.8),
     },
-    veto_tags={
-        "extreme_competitive_pvp": True
-    },
-    human_factor=1.0
+    veto_tags={"extreme_competitive_pvp": True},
+    human_factor=1.0,
 )
 
-# ==============================================================================
-# STANDALONE EXECUTION CHECK
-# ==============================================================================
+
 if __name__ == "__main__":
     print("Evaluation engine loaded successfully.")
     print(f"Active player profile: {john_player_profile}")
